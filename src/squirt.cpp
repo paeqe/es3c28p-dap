@@ -166,6 +166,13 @@ constexpr uint32_t kCooldownMs         = 2000;    // between transfers
 constexpr uint32_t kWindowChunks       = 8;
 constexpr uint32_t kMaxWindowRetries   = 24;
 
+// The close-out handshake needs the same treatment as the data window. FIN and
+// RESULT are single frames on a lossy radio, and losing either one used to end
+// with the receiver holding a complete file it had never been told to keep.
+constexpr uint32_t kFinRetryMs         = 600;
+constexpr uint32_t kMaxFinRetries      = 20;      // ~12s of asking
+constexpr uint32_t kLingerMs           = 5000;    // keep answering repeat FINs
+
 const uint8_t kBroadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 // --- state -----------------------------------------------------------------
@@ -211,9 +218,21 @@ struct Session {
     uint32_t retries    = 0;
     uint32_t lastSendAt = 0;
 
+    // sender: close-out
+    uint8_t  finHash[32] = {0};   // kept so FIN can be sent again unchanged
+    bool     finSent    = false;
+    uint32_t finSentAt  = 0;
+    uint32_t finRetries = 0;
+
     // receiver
     uint32_t nextWanted = 0;
     uint32_t sinceAck   = 0;
+
+    // receiver: close-out. Saved and finished, but deliberately still alive so
+    // a FIN the sender had to repeat gets the same answer instead of silence.
+    bool     saved      = false;
+    uint32_t savedAt    = 0;
+    Result   savedReply = {};
 
     File     file;
     bool     fileOpen = false;
@@ -714,16 +733,28 @@ void pumpSender() {
     }
 
     if (gSess.chunkCount && gSess.base >= gSess.chunkCount) {
-        FinMsg f;
-        if (gSess.hashInit) {
-            mbedtls_sha256_finish_ret(&gSess.hash, f.sha256);
-            mbedtls_sha256_free(&gSess.hash);
-            gSess.hashInit = false;
-            if (sendSealed(MSG_FIN, &f, sizeof(f))) {
-                setStatus(squirt::State::Sending, "verifying");
-            } else {
-                abortSession("could not send finish");
+        if (!gSess.finSent) {
+            if (gSess.hashInit) {
+                mbedtls_sha256_finish_ret(&gSess.hash, gSess.finHash);
+                mbedtls_sha256_free(&gSess.hash);
+                gSess.hashInit = false;
             }
+            gSess.finSent   = true;
+            gSess.finSentAt = now;
+            sendSealed(MSG_FIN, gSess.finHash, sizeof(gSess.finHash));
+            setStatus(squirt::State::Sending, "verifying");
+        } else if (now - gSess.finSentAt > kFinRetryMs) {
+            // FIN is one frame on the same lossy radio as everything else, and
+            // the receiver has no other way to learn the data is complete. Sent
+            // once and dropped, it would sit on a finished file waiting for a
+            // message that never comes, then time out and throw the file away.
+            // So keep asking until it answers, exactly like the data window.
+            if (++gSess.finRetries > kMaxFinRetries) {
+                abortSession("no confirmation from the other device");
+                return;
+            }
+            gSess.finSentAt = now;
+            sendSealed(MSG_FIN, gSess.finHash, sizeof(gSess.finHash));
         }
     }
 }
@@ -847,7 +878,16 @@ void finishReceive(const FinMsg &fin) {
     strncpy(r.message, "saved", sizeof(r.message) - 1);
     sendSealed(MSG_RESULT, &r, sizeof(r));
     Serial.printf("[squirt] received %s (%u bytes)\n", target, (unsigned)gSess.totalBytes);
-    resetSession(squirt::State::Complete, "saved to /Squirt");
+
+    // The file is safe on the card, so this side is done -- but don't tear the
+    // session down yet. RESULT can be dropped just as easily as FIN was, and if
+    // it is, the sender will ask again; without a session to answer with, it
+    // would report a failure for a transfer that actually succeeded. Linger,
+    // keep the answer, and let checkTimeouts() close this out.
+    gSess.savedReply = r;
+    gSess.saved      = true;
+    gSess.savedAt    = millis();
+    setStatus(squirt::State::Complete, "saved to /Squirt");
 }
 
 void handleData(const DataChunk &c, size_t payloadLen) {
@@ -1077,6 +1117,12 @@ void handleSealed(const Hdr &h, const uint8_t *body, size_t bodyLen) {
 
     case MSG_FIN:
         if (gSess.isSender || plainLen < sizeof(FinMsg)) return;
+        if (gSess.saved) {
+            // Already written and renamed; the sender simply didn't hear the
+            // answer. Repeat it verbatim rather than redoing any of the work.
+            sendSealed(MSG_RESULT, &gSess.savedReply, sizeof(gSess.savedReply));
+            return;
+        }
         if (gSess.doneBytes != gSess.totalBytes) {
             abortSession("transfer ended early");
             return;
@@ -1128,7 +1174,15 @@ void handleFrame(const RxFrame &f) {
         // Plaintext, so treat it as a hint, not an instruction: only act on it
         // for the session it names, from the device we're actually talking to.
         if (gSess.active && h.session == gSess.id && macEq(f.mac, gSess.peer)) {
-            resetSession(squirt::State::Failed, "the other device stopped");
+            // If the file is already saved, a sender giving up says nothing
+            // about this side -- it just never heard the answer. Don't turn a
+            // finished transfer into a reported failure. (This frame is also
+            // unauthenticated, so refusing to act on it here costs nothing.)
+            if (gSess.saved) {
+                resetSession(squirt::State::Complete, "saved to /Squirt");
+            } else {
+                resetSession(squirt::State::Failed, "the other device stopped");
+            }
         }
         return;
     default:
@@ -1209,6 +1263,16 @@ void checkTimeouts() {
     if (!gSess.active) return;
     uint32_t idle = millis() - gSess.lastActivity;
 
+    // Receiver, finished and holding the session open only to re-answer a FIN
+    // the sender had to repeat. Once the sender has clearly stopped asking,
+    // there is nothing left to answer with.
+    if (gSess.saved) {
+        if (millis() - gSess.savedAt > kLingerMs) {
+            resetSession(squirt::State::Complete, "saved to /Squirt");
+        }
+        return;
+    }
+
     switch (gStatus.state) {
     case squirt::State::Verifying:
     case squirt::State::Deciding:
@@ -1219,6 +1283,12 @@ void checkTimeouts() {
         if (idle > kHandshakeTimeoutMs) abortSession("the other device didn't answer");
         break;
     case squirt::State::Sending:
+        // Once FIN is out, silence is expected: the receiver is flushing,
+        // hashing and renaming on a card it shares with the decoder, and sends
+        // nothing meanwhile. The retry cap in pumpSender() is the authority on
+        // giving up there, so the stall timer must not fire underneath it.
+        if (!gSess.finSent && idle > kTransferStallMs) abortSession("transfer stalled");
+        break;
     case squirt::State::Receiving:
         if (idle > kTransferStallMs) abortSession("transfer stalled");
         break;

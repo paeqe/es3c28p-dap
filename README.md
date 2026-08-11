@@ -215,6 +215,18 @@ under a minute and a big FLAC takes several. It shares the card with the
 decoder, so expect playback to be less happy during a transfer — pausing
 first is not a bad idea.
 
+The close-out is retried, and it has to be. The data chunks have a sliding
+window and get resent until acknowledged, but the two frames that end a
+transfer — `FIN` ("that was all of it, here's the hash") and `RESULT` ("saved
+it") — are single frames on the same lossy radio. Sent once, either can be
+dropped: lose `FIN` and the receiver sits on a complete file it was never told
+to keep, until it times out and deletes it; lose `RESULT` and the sender
+reports a failure for a transfer that actually worked. So `FIN` now repeats
+until answered, and the receiver keeps its session alive for a few seconds
+after saving purely to re-answer a repeated `FIN` with the same reply. If you
+change that path, keep it idempotent — a second `FIN` must never redo the
+write or the rename.
+
 ### What the security actually does
 
 Everything arriving over the radio is untrusted input from an unauthenticated
