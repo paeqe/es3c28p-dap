@@ -1,0 +1,14 @@
+# PlatformIO build output and fetched libraries
+.pio
+
+# Serial monitor captures
+logs/
+
+# Editor state PlatformIO regenerates, with absolute paths in it
+.vscode/c_cpp_properties.json
+.vscode/launch.json
+.vscode/ipch
+.vscode/.browse.c_cpp.db*
+
+# Agent scratch
+.claude/
