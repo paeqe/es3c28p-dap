@@ -270,7 +270,14 @@ uint8_t              gPeerPub[kMaxPubKey];
 size_t               gPeerPubLen = 0;
 uint8_t              gPeerNonce[16];
 
-uint8_t              gStage[4096];       // sender: chunks served from here
+// Deliberately a whole number of chunks. At any other size the last chunk of
+// every refill straddles the end of the buffer, which is a trap readChunk()
+// has to handle correctly anyway -- but there is no reason to walk into it on
+// every single refill.
+constexpr uint32_t   kStageChunks = 4096 / kChunkBytes;          // 21
+constexpr uint32_t   kStageBytes  = kStageChunks * kChunkBytes;  // 4032
+
+uint8_t              gStage[kStageBytes];  // sender: chunks served from here
 uint32_t             gStageBase = 0;     // chunk index gStage[0] belongs to
 uint32_t             gStageLen  = 0;
 bool                 gStageValid = false;
@@ -674,28 +681,34 @@ bool readChunk(uint32_t index, uint8_t *out, uint16_t *outLen) {
     uint32_t offset = index * kChunkBytes;
     if (offset >= gSess.totalBytes) return false;
 
+    // How many bytes this chunk carries is a fact about the file, and nothing
+    // else. Deriving it from whatever happened to be left in the staging
+    // buffer is what quietly dropped data mid-transfer: the chunk straddling
+    // the end of a refill got cut short, the next one resumed at its own
+    // correct offset, and the bytes in between were never sent by anyone.
+    // Nothing downstream could catch it, either -- the sender digests exactly
+    // what it sends, so the hashes still agreed; it only ever surfaced as the
+    // receiver's byte count landing short of the size it had been promised.
+    uint32_t want = gSess.totalBytes - offset;
+    if (want > kChunkBytes) want = kChunkBytes;
+
+    // The whole chunk has to be staged, not merely its first byte.
     bool inStage = gStageValid && index >= gStageBase &&
-                   (index - gStageBase) * kChunkBytes < gStageLen;
+                   (uint64_t)(index - gStageBase) * kChunkBytes + want <= gStageLen;
     if (!inStage) {
         if (!player::lockCard(1500)) return false;
         bool ok = gSess.fileOpen && gSess.file.seek(offset);
         int  n  = ok ? gSess.file.read(gStage, sizeof(gStage)) : -1;
         player::unlockCard();
-        if (n <= 0) return false;
+        // A short read is a failure, not licence to send a short chunk.
+        if (n < (int)want) return false;
         gStageBase  = index;
         gStageLen   = (uint32_t)n;
         gStageValid = true;
     }
 
-    uint32_t within = (index - gStageBase) * kChunkBytes;
-    if (within >= gStageLen) return false;
-    uint32_t avail  = gStageLen - within;
-    uint32_t remain = gSess.totalBytes - offset;
-    uint32_t n      = kChunkBytes;
-    if (n > avail)  n = avail;
-    if (n > remain) n = remain;
-    memcpy(out, gStage + within, n);
-    *outLen = (uint16_t)n;
+    memcpy(out, gStage + (index - gStageBase) * kChunkBytes, want);
+    *outLen = (uint16_t)want;
     return true;
 }
 
